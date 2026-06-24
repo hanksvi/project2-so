@@ -104,6 +104,7 @@ uint64_t write(uint64_t fd, uint64_t* buffer, uint64_t bytes_to_write);
 uint64_t open(char* filename, uint64_t flags, ...);
 int fork();
 uint64_t wait(uint64_t* wstatus);
+uint64_t lseek(uint64_t fd, uint64_t offset, uint64_t whence);
 // selfie bootstraps void* to uint64_t* and unsigned to uint64_t!
 void* malloc(unsigned long);
 
@@ -1290,6 +1291,11 @@ void 	implement_fork(uint64_t* context);
 void	emit_wait();
 void	implement_wait(uint64_t* context);
 
+void emit_lseek();
+void implement_lseek(uint64_t* context);
+void	emit_mmap();
+void	implement_mmap(uint64_t* context);
+
 uint64_t is_boot_level_zero();
 
 // ------------------------ GLOBAL CONSTANTS -----------------------
@@ -1307,6 +1313,8 @@ uint64_t SYSCALL_BRK    = 214;
 
 uint64_t SYSCALL_FORK	= 215;
 uint64_t SYSCALL_WAIT	= 216;
+uint64_t SYSCALL_MMAP	= 301;
+uint64_t SYSCALL_LSEEK	= 340;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
    is passed as first argument of the openat system call
@@ -1489,6 +1497,8 @@ uint64_t L1_icache_coherency_invalidations = 0;
 // -----------------------------------------------------------------
 
 void init_memory(uint64_t megabytes);
+uint64_t* palloc();  // forward declaration
+void init_page_cache(uint64_t num_frames);
 
 uint64_t load_physical_memory(uint64_t* paddr);
 void     store_physical_memory(uint64_t* paddr, uint64_t data);
@@ -1544,6 +1554,15 @@ uint64_t HIGHESTVIRTUALADDRESS = 4294967288; // VIRTUALMEMORYSIZE * GIGABYTE - W
 // host-dependent, see init_memory()
 uint64_t NUMBEROFLEAFPTES = 512; // number of leaf page table entries == PAGESIZE / sizeof(uint64_t*)
 
+uint64_t* page_cache_memory; // bloque de memoria reservado para page cache
+uint64_t page_cache_size;  // frames totales dentro de page cache
+uint64_t page_cache_used;  // frames usados
+
+uint64_t* page_cache_fd;  // file id de cada frame
+uint64_t* page_cache_offset;  // offset del archivo de cada frame
+uint64_t* page_cache_frame; // puntero al inicio del frame
+uint64_t PAGECACHENUMFRAMES = 256;
+uint64_t MAPPING_ENTRIES = 5;
 // ------------------------- INITIALIZATION ------------------------
 
 void init_memory(uint64_t megabytes) {
@@ -1556,6 +1575,57 @@ void init_memory(uint64_t megabytes) {
 
   // host-dependent: reinitialize in case sizeof(uint64_t*) is not 8
   NUMBEROFLEAFPTES = PAGESIZE / sizeof(uint64_t*);
+}
+
+void init_page_cache(uint64_t num_frames) {
+  uint64_t i;
+  // reserva de bloque de memoria para los frames
+  page_cache_memory = malloc(num_frames * PAGESIZE);
+
+  // reservar arrays de los datos de cada frame
+  page_cache_fd = malloc(num_frames * sizeof(uint64_t));
+  page_cache_offset = malloc(num_frames * sizeof(uint64_t));
+  page_cache_frame = malloc(num_frames * sizeof(uint64_t));
+
+  // init de cada entry como libre
+  i = 0;
+  while(i < num_frames){
+    page_cache_fd[i] = -1;  // -1 libre
+    page_cache_offset[i] = -1;
+    
+    // apuntar al frame correspondiente en el bloque
+    page_cache_frame[i] = 0;
+    i = i+1;
+  }
+
+  page_cache_size = num_frames;
+  page_cache_used = 0;
+}
+
+uint64_t find_page_cache(uint64_t fd, uint64_t offset){
+  uint64_t i;
+  i = 0;
+  while(i < page_cache_used){
+    if(page_cache_fd[i] == fd && page_cache_offset[i] == offset){
+      return page_cache_frame[i];
+    }
+    i=i+1;
+  }
+
+  return -1;
+}
+
+uint64_t alloc_cache_frame(uint64_t fd, uint64_t offset){
+  
+  if(page_cache_used >= page_cache_size)
+    return -1;  // no hay espacio
+  
+  page_cache_fd[page_cache_used] = fd;
+  page_cache_offset[page_cache_used] = offset;
+  page_cache_frame[page_cache_used]  = (uint64_t) palloc();
+  page_cache_used = page_cache_used +1;
+
+  return page_cache_frame[page_cache_used -1];
 }
 
 // -----------------------------------------------------------------
@@ -2226,11 +2296,13 @@ void unblock_context(uint64_t* context);
 // | 35 | number of children	| number of forked children
 // | 36 | child exit code		| exit status code of last exited child
 // | 37 | child pid				| pid of exited child
+// | 38 | mmap  				| head de los mmaps
+// | 39 | free mmap				| address libre para un mmap
 
 // number of entries of a machine context:
 // 14 uint64_t + 6 uint64_t* + 1 char* + 7 uint64_t + 2 uint64_t* + 2 uint64_t entries
 // extended in the symbolic execution engine and the Boehm garbage collector
-uint64_t CONTEXTENTRIES = 38;
+uint64_t CONTEXTENTRIES = 40;
 uint64_t N_CONTEXTS = 0;
 uint64_t* RUNNING = (uint64_t*) 0;
 uint64_t N_BLOCKED_CONTEXTS = 0;
@@ -2329,6 +2401,9 @@ uint64_t get_status(uint64_t* context) { return *(context + 34); }
 uint64_t get_nchildren(uint64_t* context) { return *(context + 35); }
 uint64_t get_child_exit_code(uint64_t* context) { return *(context + 36); }
 uint64_t get_child_pid (uint64_t* context) { return *(context + 37); }
+uint64_t* get_mmap(uint64_t* context) { return (uint64_t*) *(context + 38); }
+uint64_t get_free_mmap (uint64_t* context) { return *(context + 39); }
+
 
 void set_next_context(uint64_t* context, uint64_t* next)     { *context        = (uint64_t) next; }
 void set_prev_context(uint64_t* context, uint64_t* prev)     { *(context + 1)  = (uint64_t) prev; }
@@ -2370,6 +2445,21 @@ void set_status(uint64_t* context, uint64_t status) { *(context + 34) = status; 
 void set_nchildren(uint64_t* context, uint64_t nchildren) { *(context + 35) = nchildren; }
 void set_child_exit_code(uint64_t* context, uint64_t exit_code) { *(context + 36) = exit_code; }
 void set_child_pid(uint64_t* context, uint64_t child_pid) { *(context + 37) = child_pid; }
+void set_mmap(uint64_t* context, uint64_t* mmp) { *(context + 38) = (uint64_t) mmp; }
+void set_free_mmap(uint64_t* context, uint64_t free) { *(context + 39) = free; }
+
+
+
+void set_mmap_next(uint64_t *mmap, uint64_t* next){*(mmap) = (uint64_t) next;}
+void set_mmap_addr(uint64_t* mmap, uint64_t addr){*(mmap + 1) = addr;}
+void set_mmap_length(uint64_t* mmap, uint64_t length){*(mmap + 2) = length;}
+void set_mmap_fd(uint64_t* mmap, uint64_t fd){*(mmap + 3) = fd;}
+void set_mmap_offset(uint64_t* mmap, uint64_t offset){*(mmap + 4) = offset;}
+
+uint64_t  get_mmap_addr(uint64_t* mmap)   { return *(mmap + 1); }
+uint64_t  get_mmap_length(uint64_t* mmap) { return *(mmap + 2); }
+uint64_t* get_mmap_next(uint64_t *mmap){return (uint64_t*) *(mmap+0);}
+
 
 // -----------------------------------------------------------------
 // -------------------------- MICROKERNEL --------------------------
@@ -2393,6 +2483,7 @@ uint64_t is_code_address(uint64_t* context, uint64_t vaddr);
 uint64_t is_data_address(uint64_t* context, uint64_t vaddr);
 uint64_t is_stack_address(uint64_t* context, uint64_t vaddr);
 uint64_t is_heap_address(uint64_t* context, uint64_t vaddr);
+uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr);
 
 uint64_t is_address_between_stack_and_heap(uint64_t* context, uint64_t vaddr);
 uint64_t is_data_stack_heap_address(uint64_t* context, uint64_t vaddr);
@@ -6341,6 +6432,8 @@ void selfie_compile() {
   emit_write();
   emit_fork();
   emit_wait();
+  emit_lseek();
+  emit_mmap();
   emit_open();
 
   emit_malloc();
@@ -8166,6 +8259,142 @@ void implement_wait(uint64_t* context) {
 		*(get_regs(context) + REG_A0) = -1;
 			set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
 	}
+}
+
+
+
+void emit_lseek() {
+  create_symbol_table_entry(GLOBAL_TABLE, string_copy("lseek"),
+    0, PROCEDURE, UINT64_T, 3, code_size);
+
+  emit_load(REG_A0, REG_SP, 0);          // fd
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+  emit_load(REG_A1, REG_SP, 0);          // offset
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+  emit_load(REG_A2, REG_SP, 0);          // whence
+  emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_addi(REG_A7, REG_ZR, SYSCALL_LSEEK);
+  emit_ecall();
+  emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void implement_lseek(uint64_t* context) {
+  uint64_t fd;
+  uint64_t offset;
+  uint64_t whence;
+
+  fd     = *(get_regs(context) + REG_A0);
+  offset = *(get_regs(context) + REG_A1);
+  whence = *(get_regs(context) + REG_A2);
+
+  *(get_regs(context) + REG_A0) = lseek(fd, offset, whence);
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+}
+
+void emit_mmap() {
+	create_symbol_table_entry(GLOBAL_TABLE, string_copy("mmap"),
+	0, PROCEDURE, UINT64_T, 4, code_size);
+
+	emit_load(REG_A0, REG_SP, 0); // addr
+	emit_addi(REG_SP, REG_SP, WORDSIZE);
+  
+  emit_load(REG_A1, REG_SP, 0); // length
+	emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A2, REG_SP, 0); // fd
+	emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A3, REG_SP, 0); // offset
+	emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+	emit_addi(REG_A7, REG_ZR, SYSCALL_MMAP);
+
+	emit_ecall();
+
+	emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+
+void read_file_into_frame(uint64_t fd, uint64_t file_offset, uint64_t* frame) {
+    uint64_t words;
+    uint64_t i;
+
+    // asegurar que IO_buffer tenga espacio para PAGESIZE
+    if (PAGESIZE > IO_buffer_size) {
+        IO_buffer_size = PAGESIZE;
+        IO_buffer = touch(smalloc(IO_buffer_size), IO_buffer_size);
+    }
+
+    // mover cursor del archivo al offset correcto
+    lseek(fd, file_offset, 0);
+
+    // leer PAGESIZE bytes del archivo en IO_buffer
+    read(fd, IO_buffer, PAGESIZE);
+
+    // copiar IO_buffer al frame físico word por word
+    words = PAGESIZE / WORDSIZE;
+    i = 0;
+    while (i < words) {
+        *(frame + i) = *(IO_buffer + i);
+        i = i + 1;
+    }
+}
+
+void implement_mmap(uint64_t* context) {
+	uint64_t addr;
+  uint64_t length;
+  uint64_t fd;
+  uint64_t offset;
+  uint64_t n_pages;
+  uint64_t i;
+  uint64_t *m;
+  uint64_t n_offset;
+  uint64_t n_addr;
+  uint64_t frame;
+
+  addr = *(get_regs(context) + REG_A0);
+  length = *(get_regs(context) + REG_A1);
+  fd = *(get_regs(context) + REG_A2);
+  offset = *(get_regs(context) + REG_A3);
+    printf("mmap: addr=%lu length=%lu fd=%lu offset=%lu\n", addr, length, fd, offset);
+  if(length % PAGESIZE != 0){
+    length = (length / PAGESIZE + 1) * PAGESIZE;
+  }
+
+  if (addr == 0){
+    addr = get_free_mmap(context);
+    set_free_mmap(context, addr + length);
+  }
+
+  m = smalloc(MAPPING_ENTRIES * sizeof(uint64_t));
+  set_mmap_addr(m, addr);
+  set_mmap_length(m, length);
+  set_mmap_fd(m, fd);
+  set_mmap_offset(m, offset);
+  set_mmap_next(m, get_mmap(context));
+  set_mmap(context, m);
+
+  n_pages = length / PAGESIZE;
+  i = 0;
+  while(i< n_pages){
+    n_offset = offset + i * PAGESIZE;
+    n_addr = addr + i*PAGESIZE;
+    frame =find_page_cache(fd, n_offset);
+        printf("mmap: page %lu n_addr=%lu n_offset=%lu frame=%lu\n", i, n_addr, n_offset, frame);
+    if(frame == (uint64_t)-1){
+      frame = alloc_cache_frame(fd, n_offset);
+      read_file_into_frame(fd, n_offset, (uint64_t*) frame);
+            printf("mmap: allocated frame=%lu\n", frame);
+    }
+
+    map_page(context, get_page_of_virtual_address(n_addr), frame);
+    i = i+1;
+  }
+    printf("mmap: returning addr=%lu\n", addr);
+  
+  *(get_regs(context) + REG_A0) = addr;
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
 }
 
 uint64_t is_boot_level_zero() {
@@ -10157,6 +10386,8 @@ void do_ecall() {
 
 					if (*(registers + REG_A7) == SYSCALL_OPENAT)
 					read_register(REG_A3);
+        if (*(registers + REG_A7) == SYSCALL_MMAP)
+					read_register(REG_A3);
 				}
 			}
 
@@ -11125,6 +11356,11 @@ void init_context(uint64_t* context, uint64_t* parent, uint64_t* vctxt) {
   set_highest_lo_page(context, get_lowest_lo_page(context));
   set_lowest_hi_page(context, get_page_of_virtual_address(HIGHESTVIRTUALADDRESS));
   set_highest_hi_page(context, get_lowest_hi_page(context));
+  
+  // init de mmaps
+  set_mmap(context, (uint64_t*)0);
+  // init de los mappings
+  
 
   if (parent != MY_CONTEXT) {
     set_code_seg_start(context, load_virtual_memory(get_pt(parent), code_seg_start(vctxt)));
@@ -11354,6 +11590,7 @@ uint64_t highest_page(uint64_t page, uint64_t hi) {
 }
 
 void map_page(uint64_t* context, uint64_t page, uint64_t frame) {
+  printf("map_page called: page=0x%lX frame=0x%lX\n", page, frame);
   uint64_t* table;
 
   if (frame != 0) {
@@ -11499,6 +11736,21 @@ uint64_t is_heap_address(uint64_t* context, uint64_t vaddr) {
 
   return 0;
 }
+uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr) {
+    uint64_t* m;
+    uint64_t  m_addr;
+    uint64_t  m_length;
+
+    m = get_mmap(context);
+    while (m != (uint64_t*) 0) {
+        m_addr   = get_mmap_addr(m);
+        m_length = get_mmap_length(m);
+        if (vaddr >= m_addr && vaddr < m_addr + m_length)
+            return 1;
+        m = get_mmap_next(m);
+    }
+    return 0;
+}
 
 uint64_t is_address_between_stack_and_heap(uint64_t* context, uint64_t vaddr) {
   // is address between heap and stack segments?
@@ -11515,6 +11767,8 @@ uint64_t is_data_stack_heap_address(uint64_t* context, uint64_t vaddr) {
   else if (is_stack_address(context, vaddr))
     return 1;
   else if (is_heap_address(context, vaddr))
+    return 1;
+  else if (is_mmap_address(context, vaddr))
     return 1;
   else
     return 0;
@@ -11533,6 +11787,8 @@ uint64_t is_valid_segment_read(uint64_t vaddr) {
     heap_reads = heap_reads + 1;
 
     return 1;
+  } else if (is_mmap_address(current_context, vaddr)) { 
+      return 1;
   } else
     return 0;
 }
@@ -11550,6 +11806,8 @@ uint64_t is_valid_segment_write(uint64_t vaddr) {
     heap_writes = heap_writes + 1;
 
     return 1;
+  } else if (is_mmap_address(current_context, vaddr)) {  
+      return 1;
   } else
     return 0;
 }
@@ -11653,6 +11911,9 @@ void up_load_binary(uint64_t* context) {
   set_data_seg_size(context, data_size);
   set_heap_seg_start(context, round_up(data_start + data_size, p_align));
   set_program_break(context, get_heap_seg_start(context));
+
+  // asignar espacio libre al free mmap
+  set_free_mmap(context, VIRTUALMEMORYSIZE * GIGABYTE / 2);
 
   baddr = 0;
 
@@ -11783,6 +12044,8 @@ uint64_t handle_system_call(uint64_t* context) {
     implement_fork(context);
   else if (a7 == SYSCALL_WAIT)
     implement_wait(context);
+  else if (a7 == SYSCALL_MMAP)
+    implement_mmap(context);
   else if (a7 == SYSCALL_EXIT) {
     implement_exit(context);
 
@@ -12192,6 +12455,7 @@ uint64_t selfie_run(uint64_t machine, uint64_t nproc) {
   reset_profiler();
   reset_microkernel();
 
+  init_page_cache(PAGECACHENUMFRAMES);
   mem_arg = peek_argument(0);
 
   if (mem_arg == (char *) 0) {
