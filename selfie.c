@@ -1562,7 +1562,7 @@ uint64_t* page_cache_fd;  // file id de cada frame
 uint64_t* page_cache_offset;  // offset del archivo de cada frame
 uint64_t* page_cache_frame; // puntero al inicio del frame
 uint64_t PAGECACHENUMFRAMES = 256;
-uint64_t MAPPING_ENTRIES = 5;
+uint64_t MAPPING_ENTRIES = 6;
 // ------------------------- INITIALIZATION ------------------------
 
 void init_memory(uint64_t megabytes) {
@@ -2452,12 +2452,17 @@ void set_free_mmap(uint64_t* context, uint64_t free) { *(context + 39) = free; }
 
 void set_mmap_next(uint64_t *mmap, uint64_t* next){*(mmap) = (uint64_t) next;}
 void set_mmap_addr(uint64_t* mmap, uint64_t addr){*(mmap + 1) = addr;}
-void set_mmap_length(uint64_t* mmap, uint64_t length){*(mmap + 2) = length;}
-void set_mmap_fd(uint64_t* mmap, uint64_t fd){*(mmap + 3) = fd;}
-void set_mmap_offset(uint64_t* mmap, uint64_t offset){*(mmap + 4) = offset;}
+void set_mmap_prot(uint64_t* mmap, uint64_t prot){*(mmap + 2) = prot;}
+void set_mmap_length(uint64_t* mmap, uint64_t length){*(mmap + 3) = length;}
+void set_mmap_fd(uint64_t* mmap, uint64_t fd){*(mmap + 4) = fd;}
+void set_mmap_offset(uint64_t* mmap, uint64_t offset){*(mmap + 5) = offset;}
+
 
 uint64_t  get_mmap_addr(uint64_t* mmap)   { return *(mmap + 1); }
-uint64_t  get_mmap_length(uint64_t* mmap) { return *(mmap + 2); }
+uint64_t  get_mmap_prot(uint64_t* mmap)   { return *(mmap + 2); }
+uint64_t  get_mmap_length(uint64_t* mmap) { return *(mmap + 3); }
+uint64_t  get_mmap_fd(uint64_t* mmap)   { return *(mmap + 4); }
+uint64_t  get_mmap_offset(uint64_t* mmap)   { return *(mmap + 5); }
 uint64_t* get_mmap_next(uint64_t *mmap){return (uint64_t*) *(mmap+0);}
 
 
@@ -2483,7 +2488,8 @@ uint64_t is_code_address(uint64_t* context, uint64_t vaddr);
 uint64_t is_data_address(uint64_t* context, uint64_t vaddr);
 uint64_t is_stack_address(uint64_t* context, uint64_t vaddr);
 uint64_t is_heap_address(uint64_t* context, uint64_t vaddr);
-uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr);
+uint64_t is_mmap_read_address(uint64_t* context, uint64_t vaddr);
+uint64_t is_mmap_write_address(uint64_t* context, uint64_t vaddr);
 
 uint64_t is_address_between_stack_and_heap(uint64_t* context, uint64_t vaddr);
 uint64_t is_data_stack_heap_address(uint64_t* context, uint64_t vaddr);
@@ -7754,6 +7760,7 @@ uint64_t copy_buffer(uint64_t* context, uint64_t vbuffer, uint64_t* buffer, uint
           return 0;
         }
 
+
         if (is_string) {
           i = 0;
 
@@ -7769,16 +7776,47 @@ uint64_t copy_buffer(uint64_t* context, uint64_t vbuffer, uint64_t* buffer, uint
 
         // advance to the next word in virtual memory
         vaddr = vaddr + WORDSIZE;
-      } else {
+      } else if (upload && is_mmap_write_address(context, vaddr)) {
+          if (is_virtual_address_mapped(get_pt(context), vaddr)) {
+            store_virtual_memory(get_pt(context), vaddr, load_word(buffer, vaddr - vbuffer, 1));
+        } else {
+          printf("%s: virtual address 0x%08lX is unmapped\n", selfie_name, vaddr);
+          return 0;
+        }
+        if (is_string) {
+          i = 0;
+          while (i < WORDSIZE) {
+            if (load_character((char*) buffer, vaddr - vbuffer + i) == 0)
+                return 1;
+            i = i + 1;
+          }
+        }
+        vaddr = vaddr + WORDSIZE;
+      } else if (!upload && is_mmap_read_address(context, vaddr)) {
+        if (is_virtual_address_mapped(get_pt(context), vaddr)) {
+            store_word(buffer, vaddr - vbuffer, 1, load_virtual_memory(get_pt(context), vaddr));
+        } else {
+            printf("%s: virtual address 0x%08lX is unmapped\n", selfie_name, vaddr);
+            return 0;
+        }
+        if (is_string) {
+            i = 0;
+            while (i < WORDSIZE) {
+                if (load_character((char*) buffer, vaddr - vbuffer + i) == 0)
+                    return 1;
+                i = i + 1;
+            }
+        }
+        vaddr = vaddr + WORDSIZE;
+    } else {
         printf("%s: virtual address 0x%08lX is in an invalid segment\n", selfie_name, vaddr);
-
         return 0;
-      }
-    else {
-      printf("%s: virtual address 0x%08lX is invalid\n", selfie_name, vaddr);
-
-      return 0;
     }
+        else {  
+          printf("%s: virtual address 0x%08lX is invalid\n", selfie_name, vaddr);
+
+          return 0;
+        }
   }
 
   if (is_string) {
@@ -8294,18 +8332,21 @@ void implement_lseek(uint64_t* context) {
 
 void emit_mmap() {
 	create_symbol_table_entry(GLOBAL_TABLE, string_copy("mmap"),
-	0, PROCEDURE, UINT64_T, 4, code_size);
+	0, PROCEDURE, UINT64_T, 5, code_size);
 
 	emit_load(REG_A0, REG_SP, 0); // addr
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
   
-  emit_load(REG_A1, REG_SP, 0); // length
+  emit_load(REG_A1, REG_SP, 0); // prot
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
 
-  emit_load(REG_A2, REG_SP, 0); // fd
+  emit_load(REG_A2, REG_SP, 0); // length
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
 
-  emit_load(REG_A3, REG_SP, 0); // offset
+  emit_load(REG_A3, REG_SP, 0); // fd
+	emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+  emit_load(REG_A4, REG_SP, 0); // offset
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
 
 	emit_addi(REG_A7, REG_ZR, SYSCALL_MMAP);
@@ -8343,6 +8384,7 @@ void read_file_into_frame(uint64_t fd, uint64_t file_offset, uint64_t* frame) {
 
 void implement_mmap(uint64_t* context) {
 	uint64_t addr;
+  uint64_t prot;
   uint64_t length;
   uint64_t fd;
   uint64_t offset;
@@ -8354,9 +8396,10 @@ void implement_mmap(uint64_t* context) {
   uint64_t frame;
 
   addr = *(get_regs(context) + REG_A0);
-  length = *(get_regs(context) + REG_A1);
-  fd = *(get_regs(context) + REG_A2);
-  offset = *(get_regs(context) + REG_A3);
+  prot = *(get_regs(context) + REG_A1);
+  length = *(get_regs(context) + REG_A2);
+  fd = *(get_regs(context) + REG_A3);
+  offset = *(get_regs(context) + REG_A4);
     printf("mmap: addr=%lu length=%lu fd=%lu offset=%lu\n", addr, length, fd, offset);
   if(length % PAGESIZE != 0){
     length = (length / PAGESIZE + 1) * PAGESIZE;
@@ -8369,6 +8412,7 @@ void implement_mmap(uint64_t* context) {
 
   m = smalloc(MAPPING_ENTRIES * sizeof(uint64_t));
   set_mmap_addr(m, addr);
+  set_mmap_prot(m, prot);
   set_mmap_length(m, length);
   set_mmap_fd(m, fd);
   set_mmap_offset(m, offset);
@@ -10386,8 +10430,11 @@ void do_ecall() {
 
 					if (*(registers + REG_A7) == SYSCALL_OPENAT)
 					read_register(REG_A3);
-        if (*(registers + REG_A7) == SYSCALL_MMAP)
-					read_register(REG_A3);
+        if (*(registers + REG_A7) == SYSCALL_MMAP){
+          read_register(REG_A3);
+          read_register(REG_A4);
+        }
+					
 				}
 			}
 
@@ -11590,7 +11637,7 @@ uint64_t highest_page(uint64_t page, uint64_t hi) {
 }
 
 void map_page(uint64_t* context, uint64_t page, uint64_t frame) {
-  printf("map_page called: page=0x%lX frame=0x%lX\n", page, frame);
+  
   uint64_t* table;
 
   if (frame != 0) {
@@ -11736,7 +11783,8 @@ uint64_t is_heap_address(uint64_t* context, uint64_t vaddr) {
 
   return 0;
 }
-uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr) {
+
+uint64_t is_mmap_read_address(uint64_t* context, uint64_t vaddr) {
     uint64_t* m;
     uint64_t  m_addr;
     uint64_t  m_length;
@@ -11745,12 +11793,39 @@ uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr) {
     while (m != (uint64_t*) 0) {
         m_addr   = get_mmap_addr(m);
         m_length = get_mmap_length(m);
-        if (vaddr >= m_addr && vaddr < m_addr + m_length)
+        if (vaddr >= m_addr && vaddr < m_addr + m_length){
+          // prot = 0 lectura, prot 1 = escritura, prot 2 = ambos
+          if(get_mmap_prot(m) == 0 || get_mmap_prot(m) == 2){
             return 1;
+          }
+          return 0;
+        }
         m = get_mmap_next(m);
     }
     return 0;
 }
+
+uint64_t is_mmap_write_address(uint64_t* context, uint64_t vaddr) {
+    uint64_t* m;
+    uint64_t  m_addr;
+    uint64_t  m_length;
+
+    m = get_mmap(context);
+    while (m != (uint64_t*) 0) {
+        m_addr   = get_mmap_addr(m);
+        m_length = get_mmap_length(m);
+        if (vaddr >= m_addr && vaddr < m_addr + m_length){
+          // prot = 0 lectura, prot 1 = escritura, prot 2 = ambos
+          if(get_mmap_prot(m) == 1 || get_mmap_prot(m) == 2){
+            return 1;
+          }
+          return 0;
+        }
+        m = get_mmap_next(m);
+    }
+    return 0;
+}
+
 
 uint64_t is_address_between_stack_and_heap(uint64_t* context, uint64_t vaddr) {
   // is address between heap and stack segments?
@@ -11767,8 +11842,6 @@ uint64_t is_data_stack_heap_address(uint64_t* context, uint64_t vaddr) {
   else if (is_stack_address(context, vaddr))
     return 1;
   else if (is_heap_address(context, vaddr))
-    return 1;
-  else if (is_mmap_address(context, vaddr))
     return 1;
   else
     return 0;
@@ -11787,7 +11860,7 @@ uint64_t is_valid_segment_read(uint64_t vaddr) {
     heap_reads = heap_reads + 1;
 
     return 1;
-  } else if (is_mmap_address(current_context, vaddr)) { 
+  } else if (is_mmap_read_address(current_context, vaddr)) { 
       return 1;
   } else
     return 0;
@@ -11806,7 +11879,7 @@ uint64_t is_valid_segment_write(uint64_t vaddr) {
     heap_writes = heap_writes + 1;
 
     return 1;
-  } else if (is_mmap_address(current_context, vaddr)) {  
+  } else if (is_mmap_write_address(current_context, vaddr)) {  
       return 1;
   } else
     return 0;
