@@ -8659,77 +8659,73 @@ void implement_mmap(uint64_t* context) {
 }
 
 void implement_munmap(uint64_t* context) {
-  uint64_t addr;
-  uint64_t* m;
-  uint64_t* prev_m;
-  uint64_t m_length;
-  uint64_t vpage;
-  uint64_t overlap_end;
-  uint64_t page;
-  uint64_t frame;
-  uint64_t file_id;
-  uint64_t file_offset;
-  uint64_t i;
+uint64_t addr;
+uint64_t* m;
+uint64_t* prev_m;
+uint64_t m_length;
+uint64_t vpage;
+uint64_t overlap_end;
+uint64_t page;
+uint64_t frame;
 
-  // 1. Leer el unico parametro (addr)
-  addr = *(get_regs(context) + REG_A0);
+// 1. Leer el unico parametro (addr)
+addr = *(get_regs(context) + REG_A0);
 
-  if (debug_syscalls)
-    printf("(munmap): addr=0x%lX\n", addr);
+if (debug_syscalls)
+printf("(munmap): addr=0x%lX\n", addr);
 
-  // 2. Recorrer lista mmap
-  m = get_mmap(context);
-  prev_m = (uint64_t*) 0;
+// 2. Recorrer lista mmap
+m = get_mmap(context);
+prev_m = (uint64_t*) 0;
 
-  while (m != (uint64_t*) 0) {
+while (m != (uint64_t*) 0) {
 
-    // 3. ^Es el mapeo exacto que buscamos?
-    if (get_mmap_addr(m) == addr) {
+// 3. ¿Es el mapeo exacto que buscamos?
+if (get_mmap_addr(m) == addr) {
 
-      // Si es el mapeo exacto, obtenemos la longitud y el file_id
+  // Si es el mapeo exacto, obtenemos la longitud
+  m_length = get_mmap_length(m);
+  overlap_end = addr + m_length;
+  vpage = addr;
 
-      m_length = get_mmap_length(m);
-      overlap_end = addr + m_length;
-      vpage = addr;
-      file_id = get_mmap_fd(m);
+  // 4. Desmapear todas las paginas de este VMA
+  while (vpage < overlap_end) {
 
-      // 4. Desmapear todas las paginas de este VMA
-      while (vpage < overlap_end) {
+    page = get_page_of_virtual_address(vpage);  // obtener el numero de pagina virtual
+    frame = get_frame_for_page(get_pt(context), page); // obtener el frame fisico correspondiente a la pagina virtual
 
-        page = get_page_of_virtual_address(vpage);  // obtener el numero de pagina virtual
-        frame = get_frame_for_page(get_pt(context), page); // obtener el frame fisico correspondiente a la pagina virtual
-
-        if (frame != 0) {
-          // Eliminar de la Page Table (PTE = 0), solo afecta a este proceso
-          set_PTE_for_page(get_pt(context), page, 0);
-        }
-        vpage = vpage + PAGESIZE;
-      }
-
-      // 5. Eliminar el nodo de la lista enlazada
-      if (prev_m == (uint64_t*) 0) {
-        // Era el primer nodo (cabeza)
-        set_mmap(context, get_mmap_next(m));
-      } else {
-        // Estaba en medio de la lista
-        set_mmap_next(prev_m, get_mmap_next(m));
-      }
-
-      // 6. Exito
-      *(get_regs(context) + REG_A0) = 0;
-      set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
-      return;
+    if (frame != 0) {
+      // Eliminar de la Page Table (PTE = 0), solo afecta a este proceso
+      set_PTE_for_page(get_pt(context), page, 0);
     }
-
-    // Avanzar en la lista si no hay coincidencia
-    prev_m = m;
-    m = get_mmap_next(m);
+    vpage = vpage + PAGESIZE;
   }
 
-  // 7. No se encontro ningun mapeo con esa direccion inicial
-  printf("%s: munmap address 0x%lX no corresponde al inicio de un mapping\n", selfie_name, addr);
-  *(get_regs(context) + REG_A0) = -1;
+  // 5. Eliminar el nodo de la lista enlazada
+  if (prev_m == (uint64_t*) 0) {
+    // Era el primer nodo (cabeza)
+    set_mmap(context, get_mmap_next(m));
+  } else {
+    // Estaba en medio de la lista
+    set_mmap_next(prev_m, get_mmap_next(m));
+  }
+
+  // 6. Exito
+  *(get_regs(context) + REG_A0) = 0;
   set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+  return;
+}
+
+// Avanzar en la lista si no hay coincidencia
+prev_m = m;
+m = get_mmap_next(m);
+
+}
+
+// 7. No se encontro ningun mapeo con esa direccion inicial
+printf("%s: munmap address 0x%lX no corresponde al inicio de un mapping\n", selfie_name, addr);
+*(get_regs(context) + REG_A0) = -1;
+set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
 }
 
 // Implementa la syscall msync.
