@@ -1299,6 +1299,8 @@ void emit_lseek();
 void implement_lseek(uint64_t* context);
 void	emit_mmap();
 void	implement_mmap(uint64_t* context);
+void	emit_munmap();
+void	implement_munmap(uint64_t* context);
 
 uint64_t is_boot_level_zero();
 
@@ -1318,6 +1320,7 @@ uint64_t SYSCALL_BRK    = 214;
 uint64_t SYSCALL_FORK	= 215;
 uint64_t SYSCALL_WAIT	= 216;
 uint64_t SYSCALL_MMAP	= 301;
+uint64_t SYSCALL_MUNMAP	= 303;
 uint64_t SYSCALL_LSEEK	= 340;
 
 /* DIRFD_AT_FDCWD corresponds to AT_FDCWD in fcntl.h and
@@ -1558,6 +1561,7 @@ uint64_t HIGHESTVIRTUALADDRESS = 4294967288; // VIRTUALMEMORYSIZE * GIGABYTE - W
 // host-dependent, see init_memory()
 uint64_t NUMBEROFLEAFPTES = 512; // number of leaf page table entries == PAGESIZE / sizeof(uint64_t*)
 
+// page cache 
 uint64_t* page_cache_memory; // bloque de memoria reservado para page cache
 uint64_t page_cache_size;  // frames totales dentro de page cache
 uint64_t page_cache_used;  // frames usados
@@ -1581,6 +1585,7 @@ void init_memory(uint64_t megabytes) {
   NUMBEROFLEAFPTES = PAGESIZE / sizeof(uint64_t*);
 }
 
+  // Inicializa la cache de paginas con un numero de frames especificos
 void init_page_cache(uint64_t num_frames) {
   uint64_t i;
   // reserva de bloque de memoria para los frames
@@ -1597,7 +1602,7 @@ void init_page_cache(uint64_t num_frames) {
     page_cache_fd[i] = -1;  // -1 libre
     page_cache_offset[i] = -1;
     
-    // apuntar al frame correspondiente en el bloque
+    // apuntar al frame correspon  diente en el bloque
     page_cache_frame[i] = 0;
     i = i+1;
   }
@@ -1606,6 +1611,7 @@ void init_page_cache(uint64_t num_frames) {
   page_cache_used = 0;
 }
 
+// busca un frame en la cache de paginas dado un file descriptor y un offset
 uint64_t find_page_cache(uint64_t fd, uint64_t offset){
   uint64_t i;
   i = 0;
@@ -1618,9 +1624,26 @@ uint64_t find_page_cache(uint64_t fd, uint64_t offset){
 
   return -1;
 }
-
+// asigna un frame en la cache de paginas dado un file descriptor y un offset
 uint64_t alloc_cache_frame(uint64_t fd, uint64_t offset){
-  
+  uint64_t i;
+
+  // Buscar un slot libre primero (marcado con fd == -1 por munmap)
+  i = 0;
+  while (i < page_cache_used) {
+    if (page_cache_fd[i] == (uint64_t)-1) {
+      page_cache_fd[i]      = fd;
+      page_cache_offset[i]  = offset;
+
+      // Si por alguna razon el frame estaba en 0, pedir uno nuevo
+      if (page_cache_frame[i] == 0)
+        page_cache_frame[i]  = (uint64_t) palloc();
+
+      return page_cache_frame[i];
+    }
+    i = i + 1;
+  }
+
   if(page_cache_used >= page_cache_size)
     return -1;  // no hay espacio
   
@@ -6444,6 +6467,7 @@ void selfie_compile() {
   emit_wait();
   emit_lseek();
   emit_mmap();
+  emit_munmap();
   emit_open();
 
   emit_malloc();
@@ -8199,14 +8223,20 @@ uint64_t is_mmap_read_address(uint64_t* context, uint64_t vaddr) {
     uint64_t* m;
     uint64_t  m_addr;
     uint64_t  m_length;
+    uint64_t  m_prot;
 
     m = get_mmap(context);
+    printf("is_mmap_read_address: vaddr=0x%lX\n", vaddr);
+
     while (m != (uint64_t*) 0) {
         m_addr   = get_mmap_addr(m);
         m_length = get_mmap_length(m);
+        m_prot   = get_mmap_prot(m);
+        printf("is_mmap_read_address: vaddr=0x%lX m_addr=0x%lX m_length=%lu prot=%lu\n", vaddr, m_addr, m_length, m_prot);
+
         if (vaddr >= m_addr && vaddr < m_addr + m_length){
           // prot = 0 lectura, prot 1 = escritura, prot 2 = ambos
-          if(get_mmap_prot(m) == 0 || get_mmap_prot(m) == 2){
+          if(m_prot == 0 || m_prot == 2){
             return 1;
           }
           return 0;
@@ -8220,14 +8250,20 @@ uint64_t is_mmap_write_address(uint64_t* context, uint64_t vaddr) {
     uint64_t* m;
     uint64_t  m_addr;
     uint64_t  m_length;
+    uint64_t  m_prot ; 
+
 
     m = get_mmap(context);
+
     while (m != (uint64_t*) 0) {
         m_addr   = get_mmap_addr(m);
+        m_prot= get_mmap_prot(m);
         m_length = get_mmap_length(m);
-        if (vaddr >= m_addr && vaddr < m_addr + m_length){
+
+        printf("is_mmap_write_address: vaddr=0x%lX m_addr=0x%lX m_length=%lu prot=%lu\n", vaddr, m_addr, m_length, m_prot);
+        if (vaddr >= m_addr && vaddr < (m_addr + m_length) ){
           // prot = 0 lectura, prot 1 = escritura, prot 2 = ambos
-          if(get_mmap_prot(m) == 1 || get_mmap_prot(m) == 2){
+          if(m_prot== 1 || m_prot == 2){
             return 1;
           }
           return 0;
@@ -8283,7 +8319,7 @@ void implement_fork(uint64_t* context) {
 	/* Copy high pages */
 	page = get_lowest_hi_page(context);
 	vaddr = page * PAGESIZE;
-while (get_page_of_virtual_address(vaddr) < get_highest_hi_page(context)) {
+  while (get_page_of_virtual_address(vaddr) < get_highest_hi_page(context)) {
     if (is_mmap_address(context, vaddr)) {
         // mapear el frame en la page table del hijo
         printf("saltando pagina: page=0x%lX next_vaddr=%lu\n", 
@@ -8416,10 +8452,10 @@ void emit_mmap() {
 	emit_load(REG_A0, REG_SP, 0); // addr
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
   
-  emit_load(REG_A1, REG_SP, 0); // prot
+  emit_load(REG_A1, REG_SP, 0); // length
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
 
-  emit_load(REG_A2, REG_SP, 0); // length
+  emit_load(REG_A2, REG_SP, 0); // prot
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
 
   emit_load(REG_A3, REG_SP, 0); // fd
@@ -8429,6 +8465,20 @@ void emit_mmap() {
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
 
 	emit_addi(REG_A7, REG_ZR, SYSCALL_MMAP);
+
+	emit_ecall();
+
+	emit_jalr(REG_ZR, REG_RA, 0);
+}
+
+void emit_munmap() {
+	create_symbol_table_entry(GLOBAL_TABLE, string_copy("munmap"),
+	0, PROCEDURE, UINT64_T, 1, code_size);
+
+	emit_load(REG_A0, REG_SP, 0); // addr
+	emit_addi(REG_SP, REG_SP, WORDSIZE);
+
+	emit_addi(REG_A7, REG_ZR, SYSCALL_MUNMAP);
 
 	emit_ecall();
 
@@ -8461,6 +8511,7 @@ void read_file_into_frame(uint64_t fd, uint64_t file_offset, uint64_t* frame) {
     }
 }
 
+// Retorna un id unico para el archivo, si el archivo ya fue mapeado antes retorna el mismo id
 uint64_t get_or_create_file_id(char* filename){
   uint64_t i;
 
@@ -8476,6 +8527,7 @@ uint64_t get_or_create_file_id(char* filename){
   return num_files -1;
 }
 
+// Implementa la syscall mmap, mapea un archivo en el espacio de direcciones virtuales del contexto
 void implement_mmap(uint64_t* context) {
 	uint64_t addr;
   uint64_t prot;
@@ -8491,50 +8543,171 @@ void implement_mmap(uint64_t* context) {
   char* filename;
   uint64_t file_id;
 
+  //lectura de argumentos: mmap(addr, length, prot, fd, offset)
   addr = *(get_regs(context) + REG_A0);
-  prot = *(get_regs(context) + REG_A1);
-  length = *(get_regs(context) + REG_A2);
+  length = *(get_regs(context) + REG_A1);
+  prot = *(get_regs(context) + REG_A2);
   fd = *(get_regs(context) + REG_A3);
   offset = *(get_regs(context) + REG_A4);
-    printf("mmap: addr=%lu length=%lu fd=%lu offset=%lu\n", addr, length, fd, offset);
-  if(length % PAGESIZE != 0){
+  
+  printf("DEBUG: Intentando mmap con fd: %lu\n", fd);
+  
+  printf("mmap: addr=%lu length=%lu fd=%lu offset=%lu\n", addr, length, fd, offset);
+  
+  // redondear length a multiplo de PAGESIZE
+    if(length % PAGESIZE != 0){
     length = (length / PAGESIZE + 1) * PAGESIZE;
   }
 
+  // si addr es 0, obtener una direccion libre para mapear
   if (addr == 0){
-    addr = get_free_mmap(context);
+    addr = get_free_mmap(context);//avanza secuencialmente la direccion libre para mapear
     set_free_mmap(context, addr + length);
   }
 
-  filename = file_id_table[fd];
-  file_id = get_or_create_file_id(filename);
+
+  filename = file_id_table[fd]; // obtener el nombre del archivo a partir del descriptor de archivo
+  file_id = get_or_create_file_id(filename); // obtener un id unico para el archivo
+  
+  // DEBUG: Verifica si file_id_table tiene lo que esperas
+  printf("DEBUG: file_id calculado: %lu\n", file_id);
+  
+  // crear una nueva estructura de mapeo y agregarla a la lista de mapeos del contexto
   m = smalloc(MAPPING_ENTRIES * sizeof(uint64_t));
+  
+  set_mmap_next(m, get_mmap(context)); // insertar al inicio de la lista de mapeos
   set_mmap_addr(m, addr);
   set_mmap_prot(m, prot);
   set_mmap_length(m, length);
   set_mmap_fd(m, file_id);
   set_mmap_offset(m, offset);
-  set_mmap_next(m, get_mmap(context));
+  //Insertar en la lista del contexto.
   set_mmap(context, m);
 
+  // mapear cada pagina del archivo al espacio de direcciones virtuales del contexto
   n_pages = length / PAGESIZE;
   i = 0;
   while(i< n_pages){
     n_offset = offset + i * PAGESIZE;
     n_addr = addr + i*PAGESIZE;
+    // DEBUG: ¿Estamos fallando al buscar en cache?
+    printf("DEBUG: Buscando frame para file_id=%lu, offset=%lu\n", file_id, n_offset);
+
     frame =find_page_cache(file_id, n_offset);
     if(frame == (uint64_t)-1){
+      // DEBUG: ¿El alloc_cache_frame devuelve NULL?
+      printf("DEBUG: alloc_cache_frame failed for file_id=%lu, offset=%lu\n", file_id, n_offset);
       frame = alloc_cache_frame(file_id, n_offset);
+      //despues borrar este if, es solo para debug
+      if (frame == (uint64_t)-1) {
+            printf("ERROR CRITICO: alloc_cache_frame devolvio -1\n");
+            return;
+             }
       read_file_into_frame(fd, n_offset, (uint64_t*) frame);
-            printf("mmap: allocated frame=%lu\n", frame);
+      printf("mmap: allocated frame=%lu\n", frame);
     }
-
+    // DEBUG: ¿Está context siendo 0? (C* no usa NULL)
+    if (context == (uint64_t*)0) { 
+        printf("CRITICO: context es 0\n"); 
+        return; // En lugar de exit(1), simplemente retorna para no crashear el host
+    }
     map_page(context, get_page_of_virtual_address(n_addr), frame);
     i = i+1;
   }
+  
+  //Se calcula el offset dentro del archivo (n_offset) y la dirección virtual (n_addr).
+  //Se busca en la page cache si el frame correspondiente ya está cargado (para reutilizar entre procesos que mapean el mismo archivo).
+  //Si no está en cache, se asigna un nuevo frame (alloc_cache_frame) y se lee el contenido del archivo (read_file_into_frame).
+  //Se mapea la página virtual al frame físico mediante map_page.
+
     printf("mmap: returning addr=%lu\n", addr);
   
   *(get_regs(context) + REG_A0) = addr;
+  set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+}
+
+void implement_munmap(uint64_t* context) {
+  uint64_t addr;
+  uint64_t* m;
+  uint64_t* prev_m;
+  uint64_t m_length;
+  uint64_t vpage;
+  uint64_t overlap_end;
+  uint64_t page;
+  uint64_t frame;
+  uint64_t file_id;
+  uint64_t file_offset;
+  uint64_t i;
+
+  // 1. Leer el unico parametro (addr)
+  addr = *(get_regs(context) + REG_A0);
+
+  if (debug_syscalls)
+    printf("(munmap): addr=0x%lX\n", addr);
+
+  // 2. Recorrer lista mmap
+  m = get_mmap(context);
+  prev_m = (uint64_t*) 0;
+
+  while (m != (uint64_t*) 0) {
+
+    // 3. ^Es el mapeo exacto que buscamos?
+    if (get_mmap_addr(m) == addr) {
+
+      m_length = get_mmap_length(m);
+      overlap_end = addr + m_length;
+      vpage = addr;
+      file_id = get_mmap_fd(m);
+
+      // 4. Desmapear todas las paginas de este VMA
+      while (vpage < overlap_end) {
+        page = get_page_of_virtual_address(vpage);
+        frame = get_frame_for_page(get_pt(context), page);
+
+        if (frame != 0) {
+          file_offset = get_mmap_offset(m) + (vpage - addr);
+
+          // 4a. Invalidar en el page cache
+          i = 0;
+          while (i < page_cache_used) {
+            if (page_cache_fd[i] == file_id && page_cache_offset[i] == file_offset) {
+              page_cache_fd[i] = (uint64_t)-1;
+              page_cache_offset[i] = (uint64_t)-1;
+              // Conservamos el frame fisico para reuso futuro
+              break;
+            }
+            i = i + 1;
+          }
+
+          // 4b. Eliminar de la Page Table (PTE = 0)
+          set_PTE_for_page(get_pt(context), page, 0);
+        }
+        vpage = vpage + PAGESIZE;
+      }
+
+      // 5. Eliminar el nodo de la lista enlazada
+      if (prev_m == (uint64_t*) 0) {
+        // Era el primer nodo (cabeza)
+        set_mmap(context, get_mmap_next(m));
+      } else {
+        // Estaba en medio de la lista
+        set_mmap_next(prev_m, get_mmap_next(m));
+      }
+
+      // 6. Exito
+      *(get_regs(context) + REG_A0) = 0;
+      set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
+      return;
+    }
+
+    // Avanzar en la lista si no hay coincidencia
+    prev_m = m;
+    m = get_mmap_next(m);
+  }
+
+  // 7. No se encontro ningun mapeo con esa direccion inicial
+  printf("%s: munmap address 0x%lX no corresponde al inicio de un mapping\n", selfie_name, addr);
+  *(get_regs(context) + REG_A0) = -1;
   set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
 }
 
@@ -11481,19 +11654,19 @@ void init_context(uint64_t* context, uint64_t* parent, uint64_t* vctxt) {
 
   // allocate zeroed memory for page table
   // TODO: save and reuse memory for page table
-  if (PAGETABLETREE == 0)
+  if (PAGETABLETREE == 0) //se le asigna memoria, en este caso son por niveles, por lo que se asigna memoria para cada nivel
     // for a 4GB-virtual-memory page table with
     // 4KB pages and 64-bit pointers, allocate
     // 8MB = 2^23 ((2^32 / 2^12) * 2^3) bytes to
     // accommodate 2^20 (2^32 / 2^12) PTEs
-    set_pt(context, zmalloc(NUMBEROFPAGES * sizeof(uint64_t*)));
+    set_pt(context, zmalloc(NUMBEROFPAGES * sizeof(uint64_t*))); // 2^32 / 2^12 = 2^20 
   else
     // for the root node (page directory), allocate
     // 16KB = 2^14 (2^32 / 2^12 / 2^9 * 2^3) bytes to
     // accommodate 2^11 ((2^32 / 2^12) / 2^9) root PDEs
     // pointing to 4KB leaf nodes (page tables) that
     // each accommodate 2^9 (2^12 / 2^3) leaf PTEs
-    set_pt(context, zmalloc(NUMBEROFPAGES / NUMBEROFLEAFPTES * sizeof(uint64_t*)));
+    set_pt(context, zmalloc(NUMBEROFPAGES / NUMBEROFLEAFPTES * sizeof(uint64_t*))); 
 
   // reset page table cache
   set_lowest_lo_page(context, 0);
@@ -11501,7 +11674,7 @@ void init_context(uint64_t* context, uint64_t* parent, uint64_t* vctxt) {
   set_lowest_hi_page(context, get_page_of_virtual_address(HIGHESTVIRTUALADDRESS));
   set_highest_hi_page(context, get_lowest_hi_page(context));
   
-  // init de mmaps
+  // inicializa mmaps virtuales, en este caso no se asigna memoria, por lo que se inicializa a 0
   set_mmap(context, (uint64_t*)0);
   // init de los mappings
   
@@ -11936,9 +12109,12 @@ uint64_t is_valid_segment_write(uint64_t vaddr) {
 
     return 1;
   } else if (is_mmap_write_address(current_context, vaddr)) {  
+      printf("DEBUG: Escritura en zona mmap validada correctamente\n");
       return 1;
-  } else
-    return 0;
+    }
+  else{
+    printf("DEBUG: Escritura en zona mmap RECHAZADA o no encontrada\n");
+    return 0;}
 }
 
 // -----------------------------------------------------------------
@@ -12175,6 +12351,8 @@ uint64_t handle_system_call(uint64_t* context) {
     implement_wait(context);
   else if (a7 == SYSCALL_MMAP)
     implement_mmap(context);
+  else if (a7 == SYSCALL_MUNMAP)
+    implement_munmap(context);
   else if (a7 == SYSCALL_EXIT) {
     implement_exit(context);
 
