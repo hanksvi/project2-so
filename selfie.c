@@ -8695,34 +8695,13 @@ void implement_munmap(uint64_t* context) {
 
       // 4. Desmapear todas las paginas de este VMA
       while (vpage < overlap_end) {
-        
+
         page = get_page_of_virtual_address(vpage);  // obtener el numero de pagina virtual
         frame = get_frame_for_page(get_pt(context), page); // obtener el frame fisico correspondiente a la pagina virtual
 
         if (frame != 0) {
-          file_offset = get_mmap_offset(m) + (vpage - addr);// calcular el offset dentro del archivo correspondiente a esta pagina virtual
-
-          // 4a. Invalidar en el page cache
-          i = 0;
-          while (i < page_cache_used) {
-              // Si encontramos el frame correspondiente en la page cache, lo invalidamos
-              // Esto permite que el frame físico pueda ser reutilizado en el futuro para otros mapeos.
-              // Se compara el file_id y el file_offset para identificar la entrada correcta en la page cache
-            if (page_cache_fd[i] == file_id && page_cache_offset[i] == file_offset) {
-              // Invalida la entrada en la page cache
-              page_cache_fd[i] = (uint64_t)-1;
-              page_cache_offset[i] = (uint64_t)-1;
-              // Conservamos el frame fisico para reuso futuro
-              break;
-            }
-            i = i + 1;
-          }
-
-          // 4b. Eliminar de la Page Table (PTE = 0)
-          set_PTE_for_page(get_pt(context), page, 0); // desmapear la pagina virtual en la page table del contexto
-          // 4c. Liberar el frame fisico (si es necesario)
-          // En este caso, no liberamos el frame físico porque podría estar siendo usado por otros
-          // mapeos del mismo archivo. La gestión de la memoria física se hace a través de la page cache.
+          // Eliminar de la Page Table (PTE = 0), solo afecta a este proceso
+          set_PTE_for_page(get_pt(context), page, 0);
         }
         vpage = vpage + PAGESIZE;
       }
@@ -8786,6 +8765,7 @@ void implement_msync(uint64_t* context) {
   found = 0;
 
   while (m != (uint64_t*) 0) {
+    // Busca un mapeo cuyo campo addr coincida exactamente con el parametro addr
     if (get_mmap_addr(m) == addr) {
       found = 1;
       break;
@@ -8829,8 +8809,8 @@ void implement_msync(uint64_t* context) {
   overlap_end = addr + m_length;
 
   while (vpage < overlap_end) {
-    page  = get_page_of_virtual_address(vpage);
-    frame = get_frame_for_page(get_pt(context), page);
+    page  = get_page_of_virtual_address(vpage); // obtener el numero de pagina virtual
+    frame = get_frame_for_page(get_pt(context), page); // obtener el frame fisico correspondiente a la pagina virtual
 
     if (frame != 0) {
       file_offset = m_offset + (vpage - addr);
