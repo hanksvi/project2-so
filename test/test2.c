@@ -13,8 +13,7 @@ uint64_t main() {
     // abrir otro archivo para leer hacia el buffer mapeado
     fd2 = open("hello.txt", 0, 0);
 
-    // intentar leer hacia memoria de solo lectura → debe fallar
-    // read usa copy_buffer con upload=1 (escribe EN memoria virtual)
+    
     read(fd2, ptr, 8);
 
     return 0;
