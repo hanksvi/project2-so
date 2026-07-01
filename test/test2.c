@@ -1,20 +1,20 @@
+uint64_t msync(uint64_t addr);
 uint64_t* foo;
+
 uint64_t main() {
     uint64_t fd;
-    uint64_t fd2;
     uint64_t* ptr;
 
-    // abrir archivo
     fd = open("hello.txt", 0, 0);
+    ptr = mmap(0, 2, 4096, fd, 0);
 
-    // mapear con prot=0 (solo lectura)
-    ptr = mmap(0, 0, 4096, fd, 0);
+    *ptr = 435510276688;
 
-    // abrir otro archivo para leer hacia el buffer mapeado
-    fd2 = open("hello.txt", 0, 0);
+    msync((uint64_t) ptr);
 
-    
-    read(fd2, ptr, 8);
+    fd = open("hello.txt", 0, 0);
+    read(fd, ptr, 8);
+    write(1, ptr, 8);
 
     return 0;
 }
