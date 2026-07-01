@@ -300,6 +300,7 @@ char*    output_buffer = (char*) 0;
 uint64_t output_cursor = 0; // cursor for output buffer
 
 char* file_id_table[256];
+uint64_t* fd_to_file_id;
 uint64_t num_files = 0;
 
 
@@ -7770,18 +7771,16 @@ uint64_t copy_buffer(uint64_t* context, uint64_t vbuffer, uint64_t* buffer, uint
   uint64_t i;
 
   if (size == 0) {
-    // include null terminator
     size = MAX_FILENAME_LENGTH + 1;
-
     is_string = 1;
   } else
     is_string = 0;
 
   vaddr = vbuffer;
 
-  // avoid integer overflow with vbuffer + size
   while (vaddr - vbuffer < size) {
-    if (is_virtual_address_valid(vaddr, WORDSIZE))
+    if (is_virtual_address_valid(vaddr, WORDSIZE)) {
+
       if (is_data_stack_heap_address(context, vaddr)) {
         if (is_virtual_address_mapped(get_pt(context), vaddr)) {
           if (upload)
@@ -7790,72 +7789,59 @@ uint64_t copy_buffer(uint64_t* context, uint64_t vbuffer, uint64_t* buffer, uint
             store_word(buffer, vaddr - vbuffer, 1, load_virtual_memory(get_pt(context), vaddr));
         } else {
           printf("%s: virtual address 0x%08lX is unmapped\n", selfie_name, vaddr);
-
           return 0;
         }
 
-
-        if (is_string) {
-          i = 0;
-
-          // check if string ends in the current word
-          // WORDSIZE may be less than sizeof(uint64_t)
-          while (i < WORDSIZE) {
-            if (load_character((char*) buffer, vaddr - vbuffer + i) == 0)
-              return 1;
-
-            i = i + 1;
-          }
-        }
-
-        // advance to the next word in virtual memory
-        vaddr = vaddr + WORDSIZE;
       } else if (upload && is_mmap_write_address(context, vaddr)) {
-          if (is_virtual_address_mapped(get_pt(context), vaddr)) {
-            store_virtual_memory(get_pt(context), vaddr, load_word(buffer, vaddr - vbuffer, 1));
-        } else {
+        if (is_virtual_address_mapped(get_pt(context), vaddr))
+          store_virtual_memory(get_pt(context), vaddr, load_word(buffer, vaddr - vbuffer, 1));
+        else {
           printf("%s: virtual address 0x%08lX is unmapped\n", selfie_name, vaddr);
           return 0;
         }
-        if (is_string) {
-          i = 0;
-          while (i < WORDSIZE) {
-            if (load_character((char*) buffer, vaddr - vbuffer + i) == 0)
-                return 1;
-            i = i + 1;
-          }
-        }
-        vaddr = vaddr + WORDSIZE;
-      } else if (!upload && is_mmap_read_address(context, vaddr)) {
-        if (is_virtual_address_mapped(get_pt(context), vaddr)) {
-            store_word(buffer, vaddr - vbuffer, 1, load_virtual_memory(get_pt(context), vaddr));
-        } else {
-            printf("%s: virtual address 0x%08lX is unmapped\n", selfie_name, vaddr);
-            return 0;
-        }
-        if (is_string) {
-            i = 0;
-            while (i < WORDSIZE) {
-                if (load_character((char*) buffer, vaddr - vbuffer + i) == 0)
-                    return 1;
-                i = i + 1;
-            }
-        }
-        vaddr = vaddr + WORDSIZE;
-    } else {
-        printf("%s: virtual address 0x%08lX is in an invalid segment\n", selfie_name, vaddr);
-        return 0;
-    }
-        else {  
-          printf("%s: virtual address 0x%08lX is invalid\n", selfie_name, vaddr);
 
+      } else if (!upload && is_mmap_read_address(context, vaddr)) {
+        if (is_virtual_address_mapped(get_pt(context), vaddr))
+          store_word(buffer, vaddr - vbuffer, 1, load_virtual_memory(get_pt(context), vaddr));
+        else {
+          printf("%s: virtual address 0x%08lX is unmapped\n", selfie_name, vaddr);
           return 0;
         }
+
+      } else if (upload && is_mmap_read_address(context, vaddr)) {
+        printf("%s: write permission denied at mmap address 0x%08lX\n", selfie_name, vaddr);
+        return 0;
+
+      } else if (!upload && is_mmap_write_address(context, vaddr)) {
+        printf("%s: read permission denied at mmap address 0x%08lX\n", selfie_name, vaddr);
+        return 0;
+
+      } else {
+        printf("%s: virtual address 0x%08lX is in an invalid segment\n", selfie_name, vaddr);
+        return 0;
+      }
+
+      if (is_string) {
+        i = 0;
+
+        while (i < WORDSIZE) {
+          if (load_character((char*) buffer, vaddr - vbuffer + i) == 0)
+            return 1;
+
+          i = i + 1;
+        }
+      }
+
+      vaddr = vaddr + WORDSIZE;
+
+    } else {
+      printf("%s: virtual address 0x%08lX is invalid\n", selfie_name, vaddr);
+      return 0;
+    }
   }
 
   if (is_string) {
     printf("%s: string is too long at virtual address 0x%08lX\n", selfie_name, vaddr);
-
     return 0;
   }
 
@@ -8021,12 +8007,30 @@ uint64_t down_load_string(uint64_t* context, uint64_t vstring, char* s) {
   return copy_buffer(context, vstring, (uint64_t*) s, 0, 0);
 }
 
+// Retorna un id unico para el archivo, si el archivo ya fue mapeado antes retorna el mismo id
+uint64_t get_or_create_file_id(char* filename){
+  uint64_t i;
+
+  i =0;
+  while(i < num_files){
+    if(string_compare(file_id_table[i], filename) == 1){
+      return i;
+    }
+    i = i+1;
+  }
+  file_id_table[num_files] = string_copy(filename);
+  num_files = num_files + 1;
+  return num_files -1;
+}
+
+
 void implement_openat(uint64_t* context) {
   // parameters
   uint64_t vfilename;
   uint64_t flags;
   uint64_t mode;
   uint64_t fd;
+  uint64_t file_id;
 
   if (debug_syscalls) {
     printf("(openat): ");
@@ -8060,7 +8064,9 @@ void implement_openat(uint64_t* context) {
     fd = *(get_regs(context) + REG_A0);
 
     if(fd != (uint64_t)-1){
-      file_id_table[fd] = string_copy(filename_buffer);
+      
+      file_id = get_or_create_file_id(filename_buffer);
+      fd_to_file_id[fd] = file_id;
     }
   } else
     *(get_regs(context) + REG_A0) = sign_shrink(-1, SYSCALL_BITWIDTH);
@@ -8232,13 +8238,13 @@ uint64_t is_mmap_read_address(uint64_t* context, uint64_t vaddr) {
     uint64_t  m_prot;
 
     m = get_mmap(context);
-    printf("is_mmap_read_address: vaddr=0x%lX\n", vaddr);
+    
 
     while (m != (uint64_t*) 0) {
         m_addr   = get_mmap_addr(m);
         m_length = get_mmap_length(m);
         m_prot   = get_mmap_prot(m);
-        printf("is_mmap_read_address: vaddr=0x%lX m_addr=0x%lX m_length=%lu prot=%lu\n", vaddr, m_addr, m_length, m_prot);
+        
 
         if (vaddr >= m_addr && vaddr < m_addr + m_length){
           // prot = 0 lectura, prot 1 = escritura, prot 2 = ambos
@@ -8289,6 +8295,36 @@ uint64_t is_mmap_address(uint64_t* context, uint64_t vaddr) {
     return 0;
 }
 
+uint64_t* copy_mmap_list(uint64_t* map) {
+  uint64_t* new_head;
+  uint64_t* new_node;
+  uint64_t* last;
+
+  new_head = (uint64_t*) 0;
+  last = (uint64_t*) 0;
+
+  while (map != (uint64_t*) 0) {
+    new_node = smalloc(MAPPING_ENTRIES * sizeof(uint64_t));
+
+    set_mmap_addr(new_node, get_mmap_addr(map));
+    set_mmap_prot(new_node, get_mmap_prot(map));
+    set_mmap_length(new_node, get_mmap_length(map));
+    set_mmap_fd(new_node, get_mmap_fd(map));
+    set_mmap_offset(new_node, get_mmap_offset(map));
+    set_mmap_next(new_node, (uint64_t*) 0);
+
+    if (new_head == (uint64_t*) 0)
+      new_head = new_node;
+    else
+      set_mmap_next(last, new_node);
+
+    last = new_node;
+    map = get_mmap_next(map);
+  }
+
+  return new_head;
+}
+
 
 void implement_fork(uint64_t* context) {
 	uint64_t* child;
@@ -8325,7 +8361,7 @@ void implement_fork(uint64_t* context) {
 	/* Copy high pages */
 	page = get_lowest_hi_page(context);
 	vaddr = page * PAGESIZE;
-  while (get_page_of_virtual_address(vaddr) < get_highest_hi_page(context)) {
+while (get_page_of_virtual_address(vaddr) < get_highest_hi_page(context)) {
     if (is_mmap_address(context, vaddr)) {
         // mapear el frame en la page table del hijo
         printf("saltando pagina: page=0x%lX next_vaddr=%lu\n", 
@@ -8357,7 +8393,7 @@ void implement_fork(uint64_t* context) {
 	set_program_break(child, get_program_break(context));
 	
   /* copiar mapping del padre al hijo*/
-  set_mmap(child, get_mmap(context));
+  set_mmap(child, copy_mmap_list(get_mmap(context)));
   set_free_mmap(child, get_free_mmap(context));
 
 	/* Copy counters */
@@ -8533,21 +8569,8 @@ void read_file_into_frame(uint64_t fd, uint64_t file_offset, uint64_t* frame) {
     }
 }
 
-// Retorna un id unico para el archivo, si el archivo ya fue mapeado antes retorna el mismo id
-uint64_t get_or_create_file_id(char* filename){
-  uint64_t i;
 
-  i =0;
-  while(i < num_files){
-    if(string_compare(file_id_table[i], filename) == 0){
-      return i;
-    }
-    i = i+1;
-  }
-  file_id_table[num_files] = string_copy(filename);
-  num_files = num_files + 1;
-  return num_files -1;
-}
+
 
 // Implementa la syscall mmap, mapea un archivo en el espacio de direcciones virtuales del contexto
 void implement_mmap(uint64_t* context) {
@@ -8562,97 +8585,49 @@ void implement_mmap(uint64_t* context) {
   uint64_t n_offset;
   uint64_t n_addr;
   uint64_t frame;
-  char* filename;
   uint64_t file_id;
 
-  //lectura de argumentos: mmap(addr, length, prot, fd, offset)
   addr = *(get_regs(context) + REG_A0);
-  length = *(get_regs(context) + REG_A1);
-  prot = *(get_regs(context) + REG_A2);
+  prot = *(get_regs(context) + REG_A1);
+  length = *(get_regs(context) + REG_A2);
   fd = *(get_regs(context) + REG_A3);
   offset = *(get_regs(context) + REG_A4);
-  
-  printf("DEBUG: Intentando mmap con fd: %lu\n", fd);
-  
-  printf("mmap: addr=%lu length=%lu fd=%lu offset=%lu prot=%lu\n", addr, length, fd, offset, prot);
-  
-  // redondear length a multiplo de PAGESIZE
+    printf("mmap: addr=%lu length=%lu fd=%lu offset=%lu\n", addr, length, fd, offset);
   if(length % PAGESIZE != 0){
     length = (length / PAGESIZE + 1) * PAGESIZE;
   }
 
-  // si addr es 0, obtener una direccion libre para mapear
   if (addr == 0){
-    addr = get_free_mmap(context);//avanza secuencialmente la direccion libre para mapear , elegie libres de la lista de mapeos del contexto
-    set_free_mmap(context, addr + length); // actualiza la direccion libre para mapear el tamaño del mapeo actual
+    addr = get_free_mmap(context);
+    set_free_mmap(context, addr + length);
   }
 
-  // Resolver archivo a partir del descriptor de archivo (fd) usando file_id_table
-  filename = file_id_table[fd]; // obtener el nombre del archivo a partir del descriptor de archivo
-  file_id = get_or_create_file_id(filename); // obtener un id unico para el archivo
-  
-  // DEBUG: Verifica si file_id_table tiene lo que esperas
-  printf("DEBUG: file_id calculado: %lu\n", file_id);
-  
-  // crear una nueva estructura de mapeo y agregarla a la lista de mapeos del contexto
-  m = smalloc(MAPPING_ENTRIES * sizeof(uint64_t));// crear el nodo mmap con smalloc y llenar campos
-  
-  set_mmap_next(m, get_mmap(context)); // actualizar el siguiente del nuevo nodo al actual cabeza de la lista
+  file_id = fd_to_file_id[fd];
+  m = smalloc(MAPPING_ENTRIES * sizeof(uint64_t));
   set_mmap_addr(m, addr);
   set_mmap_prot(m, prot);
   set_mmap_length(m, length);
   set_mmap_fd(m, file_id);
   set_mmap_offset(m, offset);
-  //Insertar en la lista del contexto.
-  set_mmap(context, m);// actualizar la cabeza de la lista de mapeos del contexto
+  set_mmap_next(m, get_mmap(context));
+  set_mmap(context, m);
 
-  // mapear cada pagina del archivo al espacio de direcciones virtuales del contexto
   n_pages = length / PAGESIZE;
   i = 0;
   while(i< n_pages){
     n_offset = offset + i * PAGESIZE;
     n_addr = addr + i*PAGESIZE;
-
-    printf("DEBUG: Buscando frame para file_id=%lu, offset=%lu\n", file_id, n_offset);
-
-    // buscar en la page cache si el frame correspondiente ya está cargado (para reutilizar entre procesos que mapean el mismo archivo).
     frame =find_page_cache(file_id, n_offset);
-
-    // si no esta en cache, asignar un nuevo frame y leer el contenido del archivo
     if(frame == (uint64_t)-1){
-      // DEBUG: ¿El alloc_cache_frame devuelve NULL?
-      printf("DEBUG: alloc_cache_frame failed for file_id=%lu, offset=%lu\n", file_id, n_offset);
       frame = alloc_cache_frame(file_id, n_offset);
-
-      // si no se pudo asignar un frame, retornar error critico
-      if (frame == (uint64_t)-1) {
-        // Esto indica un error crítico en la asignación de frames
-            printf("ERROR CRITICO: alloc_cache_frame devolvio -1\n");
-            return;
-             }
-      // Asumiendo que frame es válido, leemos el contenido del archivo en el frame
       read_file_into_frame(fd, n_offset, (uint64_t*) frame);
-      printf("mmap: allocated frame=%lu\n", frame);
+            printf("mmap: allocated frame=%lu\n", frame);
     }
 
-    // DEBUG: ¿Está context siendo 0? (C* no usa NULL)
-    // Esto es un chequeo de seguridad para evitar que se intente mapear una página en un contexto nulo
-    if (context == (uint64_t*)0) { 
-        printf("CRITICO: context es 0\n"); 
-        return; // En lugar de exit(1), simplemente retorna para no crashear el host
-    }
-
-    // Mapear la página virtual al frame físico mediante map_page
     map_page(context, get_page_of_virtual_address(n_addr), frame);
     i = i+1;
   }
-  
-  //Se calcula el offset dentro del archivo (n_offset) y la dirección virtual (n_addr).
-  //Se busca en la page cache si el frame correspondiente ya está cargado (para reutilizar entre procesos que mapean el mismo archivo).
-  //Si no está en cache, se asigna un nuevo frame (alloc_cache_frame) y se lee el contenido del archivo (read_file_into_frame).
-  //Se mapea la página virtual al frame físico mediante map_page.
-
-  printf("mmap: returning addr=%lu\n", addr);
+    printf("mmap: returning addr=%lu\n", addr);
   
   *(get_regs(context) + REG_A0) = addr;
   set_pc(context, get_pc(context) + INSTRUCTIONSIZE);
@@ -12236,11 +12211,9 @@ uint64_t is_valid_segment_write(uint64_t vaddr) {
 
     return 1;
   } else if (is_mmap_write_address(current_context, vaddr)) {  
-      printf("DEBUG: Escritura en zona mmap validada correctamente\n");
       return 1;
     }
   else{
-    printf("DEBUG: Escritura en zona mmap RECHAZADA o no encontrada\n");
     return 0;}
 }
 
@@ -12892,6 +12865,7 @@ uint64_t selfie_run(uint64_t machine, uint64_t nproc) {
   reset_microkernel();
 
   init_page_cache(PAGECACHENUMFRAMES);
+  fd_to_file_id = zmalloc(256 * sizeof(uint64_t));
   mem_arg = peek_argument(0);
 
   if (mem_arg == (char *) 0) {
