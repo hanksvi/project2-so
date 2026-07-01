@@ -14,7 +14,7 @@ write(1, "TEST 1: Lectura y Escritura (mmap + msync)\n", 43);
 
 // 1. PREPARAMOS EL ARCHIVO (Escritura inicial)
 fd = open("test_1_data.txt", 0, 0);
-ptr = (char*) mmap(0, 4096, 2, fd, 0);
+ptr = (char*) mmap(0, 2, 4096, fd, 0);
 
 *ptr = 72; // Escribimos 'H'
 msync((uint64_t) ptr); // Persistimos a disco
@@ -22,7 +22,7 @@ munmap((uint64_t) ptr); // Liberamos el mapeo
 
 // 2. AHORA EVALUAMOS LA LECTURA
 fd = open("test_1_data.txt", 0, 0);
-ptr = (char*) mmap(0, 4096, 2, fd, 0); 
+ptr = (char*) mmap(0, 2, 4096, fd, 0); 
 
 if (*ptr == 72) {
     write(1, "-> OK: Lectura correcta desde mmap\n", 35);
@@ -46,7 +46,7 @@ munmap((uint64_t) ptr);
 
 // 4. VERIFICAMOS PERSISTENCIA
 fd = open("test_1_data.txt", 0, 0);
-ptr = (char*) mmap(0, 4096, 2, fd, 0); 
+ptr = (char*) mmap(0, 2, 4096, fd, 0); 
 
 if (*ptr == 87) {
     write(1, "-> OK: Cambios persistieron en disco!\n", 38);

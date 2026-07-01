@@ -13,7 +13,7 @@ write(1, "TEST 3: Prueba de Dirty/Modified Bits\n", 38);
 write(1, "Nota: Revisa los logs de Selfie para comprobar si hubo escritura a disco\n", 73);
 
 fd = open("test_3_dirty.txt", 0, 0);
-ptr = (char*) mmap(0, 4096, 2, fd, 0);
+ptr = (char*) mmap(0, 2, 4096, fd, 0);
 
 if ((uint64_t)ptr == (uint64_t)-1) { return -1; }
 if ((uint64_t)ptr == 0)            { return -1; }

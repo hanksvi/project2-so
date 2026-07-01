@@ -13,7 +13,7 @@ uint64_t i; // <-- Declaracion movida al inicio de la funcion
 write(1, "TEST 2: Creacion de mappings compartidos\n", 41);
 
 fd = open("test_2_shared.txt", 0, 0);
-ptr = (char*) mmap(0, 4096, 2, fd, 0);
+ptr = (char*) mmap(0, 2, 4096, fd, 0);
 
 *ptr = 65; // 'A'
 
