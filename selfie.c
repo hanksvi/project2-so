@@ -1575,6 +1575,7 @@ uint64_t page_cache_used;  // frames usados
 uint64_t* page_cache_fd;  // file id de cada frame
 uint64_t* page_cache_offset;  // offset del archivo de cada frame
 uint64_t* page_cache_frame; // puntero al inicio del frame
+uint64_t* page_cache_dirty; // 0=limpio, 1=sucio (modificado desde ultimo msync)
 uint64_t PAGECACHENUMFRAMES = 256;
 uint64_t MAPPING_ENTRIES = 6;
 // ------------------------- INITIALIZATION ------------------------
@@ -1601,6 +1602,7 @@ void init_page_cache(uint64_t num_frames) {
   page_cache_fd = malloc(num_frames * sizeof(uint64_t));
   page_cache_offset = malloc(num_frames * sizeof(uint64_t));
   page_cache_frame = malloc(num_frames * sizeof(uint64_t));
+  page_cache_dirty = malloc(num_frames * sizeof(uint64_t));
 
   // init de cada entry como libre
   i = 0;
@@ -1610,6 +1612,7 @@ void init_page_cache(uint64_t num_frames) {
     
     // apuntar al frame correspon  diente en el bloque
     page_cache_frame[i] = 0;
+    page_cache_dirty[i] = 0;
     i = i+1;
   }
 
@@ -1640,6 +1643,7 @@ uint64_t alloc_cache_frame(uint64_t fd, uint64_t offset){
     if (page_cache_fd[i] == (uint64_t)-1) {
       page_cache_fd[i]      = fd;
       page_cache_offset[i]  = offset;
+      page_cache_dirty[i]   = 0;
 
       // Si por alguna razon el frame estaba en 0, pedir uno nuevo
       if (page_cache_frame[i] == 0)
@@ -1656,6 +1660,7 @@ uint64_t alloc_cache_frame(uint64_t fd, uint64_t offset){
   page_cache_fd[page_cache_used] = fd;
   page_cache_offset[page_cache_used] = offset;
   page_cache_frame[page_cache_used]  = (uint64_t) palloc();
+  page_cache_dirty[page_cache_used]  = 0;
   page_cache_used = page_cache_used +1;
 
   return page_cache_frame[page_cache_used -1];
@@ -8494,10 +8499,10 @@ void emit_mmap() {
 	emit_load(REG_A0, REG_SP, 0); // addr
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
   
-  emit_load(REG_A1, REG_SP, 0); // length
+  emit_load(REG_A1, REG_SP, 0); // prot
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
 
-  emit_load(REG_A2, REG_SP, 0); // prot
+  emit_load(REG_A2, REG_SP, 0); // length
 	emit_addi(REG_SP, REG_SP, WORDSIZE);
 
   emit_load(REG_A3, REG_SP, 0); // fd
@@ -8723,6 +8728,8 @@ void implement_msync(uint64_t* context) {
   uint64_t file_offset;
   uint64_t host_fd;
   uint64_t i;
+  uint64_t j;
+  uint64_t dirty_idx;
   uint64_t found;
 
   // 1. Leer unico parametro (addr)
@@ -8775,7 +8782,7 @@ void implement_msync(uint64_t* context) {
     IO_buffer = touch(smalloc(IO_buffer_size), IO_buffer_size);
   }
 
-  // 5. Recorrer cada pagina virtual del mapeo y escribir al archivo
+  // 5. Recorrer cada pagina virtual del mapeo y escribir al archivo solo las sucias
   vpage       = addr;
   overlap_end = addr + m_length;
 
@@ -8786,16 +8793,35 @@ void implement_msync(uint64_t* context) {
     if (frame != 0) {
       file_offset = m_offset + (vpage - addr);
 
-      // copiar frame a IO_buffer
-      i = 0;
-      while (i < PAGESIZE / WORDSIZE) {
-        *(IO_buffer + i) = *((uint64_t*) frame + i);
-        i = i + 1;
+      // buscar el indice en page cache para este frame
+      dirty_idx = page_cache_used; // centinela = no encontrado
+      j = 0;
+      while (j < page_cache_used) {
+        if (page_cache_frame[j] == frame) {
+          dirty_idx = j;
+          break;
+        }
+        j = j + 1;
       }
 
-      // posicionar y escribir al archivo
-      lseek(host_fd, file_offset, 0);
-      write(host_fd, IO_buffer, PAGESIZE);
+      // solo escribir si la pagina esta sucia (o no esta en page cache)
+      if (dirty_idx == page_cache_used || page_cache_dirty[dirty_idx] == 1) {
+        // copiar frame a IO_buffer
+        printf("Writing page at offset %lu\n", file_offset);
+        i = 0;
+        while (i < PAGESIZE / WORDSIZE) {
+          *(IO_buffer + i) = *((uint64_t*) frame + i);
+          i = i + 1;
+        }
+
+        // posicionar y escribir al archivo
+        lseek(host_fd, file_offset, 0);
+        write(host_fd, IO_buffer, PAGESIZE);
+      }
+
+      // si estaba en page cache, limpiar dirty bit
+      if (dirty_idx < page_cache_used)
+        page_cache_dirty[dirty_idx] = 0;
     }
 
     vpage = vpage + PAGESIZE;
@@ -9416,10 +9442,27 @@ uint64_t load_virtual_memory(uint64_t* table, uint64_t vaddr) {
 }
 
 void store_virtual_memory(uint64_t* table, uint64_t vaddr, uint64_t data) {
+  uint64_t page;
+  uint64_t frame;
+  uint64_t i;
+
   // assert: is_virtual_address_valid(vaddr, WORDSIZE) == 1
   // assert: is_virtual_address_mapped(table, vaddr) == 1
 
   store_physical_memory(tlb(table, vaddr), data);
+
+  // marcar dirty si el frame pertenece al page cache
+  page  = get_page_of_virtual_address(vaddr);
+  frame = get_frame_for_page(table, page);
+
+  i = 0;
+  while (i < page_cache_used) {
+    if (page_cache_frame[i] == frame) {
+      page_cache_dirty[i] = 1;
+      break;
+    }
+    i = i + 1;
+  }
 }
 
 uint64_t load_cached_virtual_memory(uint64_t* table, uint64_t vaddr) {

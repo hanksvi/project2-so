@@ -6,9 +6,11 @@ uint64_t main() {
     uint64_t ptr;
 
     fd = open("hello.txt", 0, 0);
+    // archivo abierto con prot = 0 lectura
     ptr = mmap(0, 0, 4096, fd, 0);
 
     fd2 = open("hello.txt", 0, 0);
+    // se intenta escribir en ptr, falla
     read(fd2, ptr, 8);
 
     return 0;
